@@ -8,13 +8,17 @@ module Middleware
 
     def conn(*retry_args)
       Faraday.new do |b|
+        b.request :multipart
         b.request :retry, *retry_args
         b.adapter :test do |stub|
-          ['get', 'post'].each do |method|
-            stub.send(method, '/unstable') {
+          ['get', 'post', 'put'].each do |method|
+            stub.send(method, '/unstable') do |env|
+              posted_as = env[:request_headers]['Content-Type']
+              [200, {'Content-Type' => posted_as}, env[:body]]
               @times_called += 1
               @explode.call @times_called
-            }
+            end
+
           end
         end
       end
@@ -138,7 +142,7 @@ module Middleware
       assert_equal 1, @times_called
     end
 
-    def test_should_not_call_retry_if_for_idempotent_methods
+    def test_should_not_call_retry_if_for_idempotent_methods_if_methods_unspecified
       @explode = lambda {|n| raise Errno::ETIMEDOUT }
       check = lambda { |env,exception| raise "this should have never been called" }
       assert_raises(Errno::ETIMEDOUT) {
@@ -147,12 +151,45 @@ module Middleware
       assert_equal 3, @times_called
     end
 
-    def test_should_not_retry_for_non_idempotent_method
+    def test_should_not_retry_for_non_idempotent_method_if_methods_unspecified
       @explode = lambda {|n| raise Errno::ETIMEDOUT }
       assert_raises(Errno::ETIMEDOUT) {
         conn.post("/unstable")
       }
       assert_equal 1, @times_called
+    end
+
+    def test_should_not_call_retry_if_for_specified_methods
+      @explode = lambda {|n| raise Errno::ETIMEDOUT }
+      check = lambda { |env,exception| raise "this should have never been called" }
+      assert_raises(Errno::ETIMEDOUT) {
+        conn(:retry_if => check, :methods => [:post]).post("/unstable")
+      }
+      assert_equal 3, @times_called
+    end
+
+    def test_should_call_retry_if_for_empty_method_list
+      @explode = lambda {|n| raise Errno::ETIMEDOUT }
+      check = lambda { |env,exception| @times_called < 2 }
+      assert_raises(Errno::ETIMEDOUT) {
+        conn(:retry_if => check, :methods => []).get("/unstable")
+      }
+      assert_equal 2, @times_called
+    end
+
+    def test_retry_should_not_add_multiple_boundary_to_headers
+      @explode = lambda do |n|
+        if n == 1
+          raise 'Error'
+        else
+          nil
+        end
+      end
+      file = Faraday::UploadIO.new(__FILE__, 'text/x-ruby')
+      payload = {:file => file}
+      response = conn(:max => 2, :exceptions => RuntimeError).put('/unstable', payload)
+
+      assert_equal 'multipart/form-data; boundary=-----------RubyMultipartPost', response.env[:request_headers]['Content-Type']
     end
 
   end
